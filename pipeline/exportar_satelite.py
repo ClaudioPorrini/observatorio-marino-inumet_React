@@ -413,7 +413,9 @@ def motivo_rechazo(ruta: Path) -> str | None:
             lat = np.asarray(ds[_nombre_coord(ds, ("lat", "latitude"))].values[:2], dtype="float64")
         paso = abs(float(lat[1] - lat[0])) if lat.size == 2 else float("nan")
         if not RE_TITULO_MUR.search(titulo):
-            motivo = f"no es MUR (título: {titulo[:45]!r})"
+            # La fecha del título se reemplaza para que el informe agrupe archivos del mismo origen
+            generico = re.sub(r"\d{4}-\d{2}-\d{2}", "AAAA-MM-DD", titulo)
+            motivo = f"no es MUR (título: {generico[:50]!r})"
         elif not abs(paso - PASO_MUR) < 1e-4:
             motivo = f"grilla de {paso:g}° (se espera {PASO_MUR}°)"
     except Exception as e:
