@@ -390,18 +390,76 @@ def meta_grilla_desde_geometria(g: Geometria) -> dict:
 # ──────────────────────────────────────────────────────────
 # PRODUCTOS MUR
 # ──────────────────────────────────────────────────────────
-def fuentes_mur(clave: str, dias: int) -> list[tuple[str, Path]]:
-    """Las `dias` fechas más recientes con archivo: [(fecha_iso, ruta)] de más nueva a más vieja."""
+# Solo se publica MUR a 0,01°. En las carpetas de origen conviven, con el mismo nombre MUR_*.nc,
+# archivos de OSTIA "blended" (0,05°) y anomalías calculadas localmente: esos quedan afuera para
+# que nada se muestre rotulado como MUR sin serlo. (Plan B futuro: si MUR deja de existir, el
+# blended entra como producto PROPIO, con su nombre, no mezclado acá.)
+RE_TITULO_MUR = re.compile(r"\bMUR\b")
+PASO_MUR = 0.01
+
+_motivos_rechazo: dict[Path, str | None] = {}     # caché por corrida: cada archivo se mira una vez
+
+
+def motivo_rechazo(ruta: Path) -> str | None:
+    """None si el archivo es MUR a 0,01°; si no, el motivo (para el resumen)."""
+    if ruta in _motivos_rechazo:
+        return _motivos_rechazo[ruta]
+    import xarray as xr
+
+    motivo = None
+    try:
+        with xr.open_dataset(ruta) as ds:
+            titulo = str(ds.attrs.get("title", ""))
+            lat = np.asarray(ds[_nombre_coord(ds, ("lat", "latitude"))].values[:2], dtype="float64")
+        paso = abs(float(lat[1] - lat[0])) if lat.size == 2 else float("nan")
+        if not RE_TITULO_MUR.search(titulo):
+            motivo = f"no es MUR (título: {titulo[:45]!r})"
+        elif not abs(paso - PASO_MUR) < 1e-4:
+            motivo = f"grilla de {paso:g}° (se espera {PASO_MUR}°)"
+    except Exception as e:
+        motivo = f"no se pudo leer: {type(e).__name__}"
+    _motivos_rechazo[ruta] = motivo
+    return motivo
+
+
+def archivos_mur(clave: str) -> dict[str, Path]:
+    """Todas las fechas con archivo en disco (válido o no): {fecha_iso: ruta}."""
     cfg = PRODUCTOS_MUR[clave]
     if not cfg["directorio"].is_dir():
-        return []
+        return {}
     encontradas = {}
     for p in cfg["directorio"].iterdir():
         m = cfg["patron"].match(p.name)
         iso = compacta_a_iso(m.group(1)) if m else None
         if iso and p.is_file():
             encontradas[iso] = p
-    return sorted(encontradas.items(), reverse=True)[:dias]
+    return encontradas
+
+
+def fuentes_mur(clave: str, dias: int) -> list[tuple[str, Path]]:
+    """Las `dias` fechas más recientes con archivo MUR VÁLIDO, de más nueva a más vieja.
+    Un archivo rechazado no ocupa lugar en la ventana: se toma el siguiente válido."""
+    out = []
+    for iso, ruta in sorted(archivos_mur(clave).items(), reverse=True):
+        if motivo_rechazo(ruta) is None:
+            out.append((iso, ruta))
+            if len(out) == dias:
+                break
+    return out
+
+
+def informe_rechazos() -> None:
+    """Resumen de archivos dejados afuera, agrupados por motivo."""
+    por_motivo: dict[str, list[str]] = {}
+    for ruta, motivo in _motivos_rechazo.items():
+        if motivo:
+            m = re.search(r"\d{8}", ruta.name)
+            por_motivo.setdefault(f"{ruta.parent.name}: {motivo}", []).append(m.group() if m else ruta.name)
+    if por_motivo:
+        print("\nArchivos NO publicados (no son MUR 0,01°):")
+        for motivo, fechas in sorted(por_motivo.items()):
+            fechas.sort()
+            print(f"  {len(fechas):>3} · {motivo} · {fechas[0]} → {fechas[-1]}")
 
 
 def exportar_mur(clave: str, salida: Path, dias: int, formato: str, forzar: bool) -> tuple[dict, list[str]]:
@@ -604,7 +662,7 @@ def exportar_puntos(salida: Path, dias: int, forzar: bool) -> tuple[dict | None,
     cache = {} if forzar else _leer_cache_puntos()
     errores: list[str] = []
     avisos_por_punto: dict[str, set[str]] = {}
-    nuevas = 0
+    nuevas = purgadas = 0
 
     for clave in ("sst", "anom"):
         cfg = PRODUCTOS_MUR[clave]
@@ -621,11 +679,20 @@ def exportar_puntos(salida: Path, dias: int, forzar: bool) -> tuple[dict | None,
             except Exception as e:
                 errores.append(f"puntos {clave} {iso}: {e}")
 
+    # Valores calculados antes con archivos que hoy se rechazan (p. ej. OSTIA): fuera de la caché.
+    # Las fechas cuyo archivo ya no está en disco se conservan (la caché guarda la historia).
+    for clave in ("sst", "anom"):
+        for iso, ruta in archivos_mur(clave).items():
+            if motivo_rechazo(ruta) is not None and cache.pop((clave, iso), None) is not None:
+                purgadas += 1
+
     # Puntos que se sacaron de la lista: fuera de la caché también.
     for k in cache:
         cache[k] = {pid: v for pid, v in cache[k].items() if pid in ids}
-    if nuevas or forzar:
+    if nuevas or purgadas or forzar:
         _escribir_cache_puntos(cache)
+    if purgadas:
+        print(f"  [puntos] {purgadas} fecha(s) quitadas de la caché: venían de archivos que no son MUR 0,01°")
 
     nombres = {p[0]: p[1] for p in PUNTOS_COSTEROS}
     for pid, avs in sorted(avisos_por_punto.items()):
@@ -732,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
     puntos, e = exportar_puntos(salida, args.dias_serie, args.forzar)
     errores += e
 
+    informe_rechazos()                                   # antes de cualquier salida temprana
     faltan = [str(d) for d in (NC4_DIR, ANOM_DIR, CACHE_DIR, FRENTE_DIR) if not d.is_dir()]
     if faltan:
         print("\nAVISO: no existen estas carpetas de origen:")
